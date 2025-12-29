@@ -1,9 +1,225 @@
-<h1>EC2 Details</h1>
-<p>Served by Load balancer new</p>
-<pre>
-ID: {{INSTANCE_ID}}
-Type: {{INSTANCE_TYPE}}
-AZ: {{AVAILABILITY_ZONE}}
-Private IP: {{LOCAL_IPV4}}
-Public IP: {{PUBLIC_IPV4}}
-</pre>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rotating Octahedron + Physics Balls</title>
+  <style>
+    html, body { height: 100%; margin: 0; overflow: hidden; background: #0b0f1a; }
+    #hud {
+      position: fixed; left: 12px; top: 12px;
+      color: #e7ecff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-size: 13px; line-height: 1.35;
+      background: rgba(10, 14, 28, 0.55); border: 1px solid rgba(255,255,255,0.12);
+      padding: 10px 12px; border-radius: 12px; backdrop-filter: blur(6px);
+      max-width: 360px;
+    }
+    #hud b { font-weight: 700; }
+    #hud .row { margin-top: 6px; opacity: 0.9; }
+    a { color: #b9c7ff; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><b>Rotating Octahedron + 3 Physics Balls</b></div>
+    <div class="row">Mouse: drag to orbit • Wheel: zoom</div>
+    <div class="row">Keys: <b>R</b> reset • <b>Space</b> toggle gravity</div>
+    <div class="row" id="stats"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
+
+    // ---------- Scene ----------
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x0b0f1a, 12, 40);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+    camera.position.set(10, 7, 12);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+
+    // Lights (simple but nice)
+    scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(8, 12, 6);
+    scene.add(dir);
+
+    // ---------- Octahedron ----------
+    // Octahedron centered at origin with vertices at (±a,0,0), (0,±a,0), (0,0,±a)
+    const a = 4.0; // size (bigger = more room)
+    const octGeo = new THREE.OctahedronGeometry(a, 0);
+
+    // Solid (transparent)
+    const octMat = new THREE.MeshStandardMaterial({
+      color: 0x2d5cff,
+      transparent: true,
+      opacity: 0.10,
+      roughness: 0.35,
+      metalness: 0.2,
+      side: THREE.DoubleSide
+    });
+    const octMesh = new THREE.Mesh(octGeo, octMat);
+    scene.add(octMesh);
+
+    // Wireframe overlay
+    const wire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(octGeo),
+      new THREE.LineBasicMaterial({ color: 0xb9c7ff, transparent: true, opacity: 0.65 })
+    );
+    scene.add(wire);
+
+    // Small axes helper (optional-ish)
+    // scene.add(new THREE.AxesHelper(6));
+
+    // ---------- Physics ----------
+    // We'll simulate balls in world coordinates, while the octahedron rotates.
+    // Collision is computed against the octahedron planes transformed to world coordinates each frame.
+
+    const gravityOn = { value: true };
+    const g = new THREE.Vector3(0, -9.8, 0);
+    const restitution = 0.72;   // bounce
+    const surfaceFriction = 0.05; // tangential damping on collision
+    const airDamping = 0.999;   // slight damping each step
+    const maxSubsteps = 6;
+
+    const ballRadius = 0.30;
+    const ballMass = 1.0;
+
+    const ballGeo = new THREE.SphereGeometry(ballRadius, 24, 24);
+    const ballMats = [
+      new THREE.MeshStandardMaterial({ color: 0xff4d4d, roughness: 0.35, metalness: 0.1 }),
+      new THREE.MeshStandardMaterial({ color: 0x3dff8f, roughness: 0.35, metalness: 0.1 }),
+      new THREE.MeshStandardMaterial({ color: 0xffd43d, roughness: 0.35, metalness: 0.1 }),
+    ];
+
+    const balls = [];
+    function makeBall(mat, seedVel) {
+      const mesh = new THREE.Mesh(ballGeo, mat);
+      mesh.position.set(0, 0, 0);
+      scene.add(mesh);
+      return {
+        mesh,
+        p: mesh.position.clone(),
+        v: seedVel.clone(),
+        m: ballMass
+      };
+    }
+
+    function randDir(scale=1) {
+      const v = new THREE.Vector3(
+        (Math.random()*2-1),
+        (Math.random()*2-1),
+        (Math.random()*2-1)
+      );
+      v.normalize().multiplyScalar(scale);
+      return v;
+    }
+
+    function resetBalls() {
+      // Start in center but with small different velocities so they separate
+      balls.length = 0;
+      // remove old meshes if any
+      scene.traverse(obj => {}); // no-op
+      // easiest: just keep creating new and remove old in a controlled list
+    }
+
+    // We'll store meshes separately so we can reset cleanly
+    const ballMeshes = [];
+    function clearBallMeshes() {
+      for (const m of ballMeshes) scene.remove(m);
+      ballMeshes.length = 0;
+    }
+
+    function initBalls() {
+      clearBallMeshes();
+      balls.length = 0;
+      const v0 = randDir(2.5);
+      const v1 = randDir(2.2);
+      const v2 = randDir(2.0);
+      const b0 = makeBall(ballMats[0], v0);
+      const b1 = makeBall(ballMats[1], v1);
+      const b2 = makeBall(ballMats[2], v2);
+      ballMeshes.push(b0.mesh, b1.mesh, b2.mesh);
+      balls.push(b0, b1, b2);
+
+      // Slightly offset positions by a tiny epsilon so they don't perfectly overlap numerically
+      balls[0].p.set( 0.000, 0.000, 0.000);
+      balls[1].p.set( 0.001, 0.000, 0.000);
+      balls[2].p.set(-0.001, 0.000, 0.000);
+
+      for (const b of balls) {
+        b.mesh.position.copy(b.p);
+      }
+    }
+    initBalls();
+
+    // Ball-ball collisions (simple elastic-ish with restitution)
+    function resolveBallBall(bi, bj) {
+      const dp = bj.p.clone().sub(bi.p);
+      const dist = dp.length();
+      const minDist = ballRadius * 2.0;
+      if (dist === 0 || dist >= minDist) return;
+
+      const n = dp.multiplyScalar(1 / dist); // collision normal from i->j
+      const penetration = (minDist - dist);
+
+      // Positional correction (split)
+      const corr = n.clone().multiplyScalar(penetration * 0.5);
+      bi.p.add(corr.clone().multiplyScalar(-1));
+      bj.p.add(corr);
+
+      // Relative velocity along normal
+      const rv = bj.v.clone().sub(bi.v);
+      const vn = rv.dot(n);
+      if (vn > 0) return; // separating
+
+      // Impulse
+      const e = restitution * 0.9;
+      const j = -(1 + e) * vn / (1/bi.m + 1/bj.m);
+      const impulse = n.clone().multiplyScalar(j);
+      bi.v.add(impulse.clone().multiplyScalar(-1/bi.m));
+      bj.v.add(impulse.clone().multiplyScalar( 1/bj.m));
+
+      // Tangential damping (crude friction between balls)
+      const tangent = rv.clone().sub(n.clone().multiplyScalar(vn));
+      if (tangent.lengthSq() > 1e-12) {
+        tangent.normalize();
+        const jt = -rv.dot(tangent) / (1/bi.m + 1/bj.m);
+        const mu = 0.03;
+        const frictionImpulse = tangent.multiplyScalar(THREE.MathUtils.clamp(jt, -mu*j, mu*j));
+        bi.v.add(frictionImpulse.clone().multiplyScalar(-1/bi.m));
+        bj.v.add(frictionImpulse.clone().multiplyScalar( 1/bj.m));
+      }
+    }
+
+    // ---------- Octahedron collision planes ----------
+    // Octahedron faces can be represented by 8 planes:
+    // For |x| + |y| + |z| <= a
+    // Each face corresponds to sgn(x)*x + sgn(y)*y + sgn(z)*z = a
+    // Let n_local be one of (±1, ±1, ±1) normalized; plane is n·p <= a/|n_raw|
+    // For raw n=(±1,±1,±1), |n_raw|=sqrt(3), so n_unit = n_raw/sqrt(3),
+    // and plane constant in local coords is d = a/sqrt(3), with inside being n_unit·p <= d
+    const dLocal = a / Math.sqrt(3);
+    const normalsLocal = [];
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+      normalsLocal.push(new THREE.Vector3(sx, sy, sz).normalize());
+    }
+
+    function worldPlanesFromObject(obj) {
+      // Transform local plane normals by obj rotation to world,
+      // and plane point is object origin (0,0,0) in world.
+      const q = obj.quaternion;
+      const centerW = obj.getWorldPosition(new THREE.Vector3());
+      const planes = [];
+      for (const nL of normalsLocal) {
+        const nW = nL.clone().applyQuaternion(q).normalize();
+        // F
